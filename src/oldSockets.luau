@@ -1177,7 +1177,7 @@ function Socket:CallParallel(operations: {ParallelOperation}, strategy: string?)
 	}
 end
 
--- Rooms hold player references; drop them automatically when a player leaves
+-- Rooms hold player references, drop them automatically when a player leaves
 -- so no socket keeps a leaving player alive or broadcasts to them.
 if RunService:IsServer() then
 	game:GetService("Players").PlayerRemoving:Connect(function(player: Player)
