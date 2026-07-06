@@ -1,4 +1,3 @@
---!strict
 --[[
     Socket Module
     ---------------
@@ -86,7 +85,6 @@ export type Socket = {
 	-- Core communication methods
 	On: (self: Socket, eventName: string, callback: ListenerCallback) -> (),
 	Off: (self: Socket, eventName: string, callback: ListenerCallback?) -> (),
-	Detach: (self: Socket, eventName: string) -> (),
 	Once: (self: Socket, eventName: string, callback: ListenerCallback) -> (),
 	Emit: (self: Socket, eventName: string, ...any) -> (),
 	EmitUnreliable: (self: Socket, eventName: string, ...any) -> (),
@@ -541,14 +539,6 @@ function Socket:Off(eventName: string, callback: ListenerCallback?)
 		if self.debug then
 			print("[Socket DEBUG] Removed all listeners for event:", eventName)
 		end
-	end
-end
-
--- Unhooks every listener registered for the given event name
-function Socket:Detach(eventName: string)
-	self.listeners[eventName] = nil
-	if self.debug then
-		print("[Socket DEBUG] Detached all listeners for event:", eventName)
 	end
 end
 
