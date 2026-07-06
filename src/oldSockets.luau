@@ -7,6 +7,11 @@
 	This module provides a clean API for sending and receiving events, as well as middleware
 	functionality for modifying event data before it is sent or received.
 
+	Sockets are cached by name: calling Socket.new with the same name (or a remote
+	event with the same name) returns the existing socket instead of creating a
+	duplicate. Rooms can be explicitly created with CreateRoom (they then persist
+	while empty) and torn down all at once with DestroyRoom.
+
 	https://github.com/OMouta/roblox-sockets
 --]]
 
@@ -43,6 +48,9 @@ local ERRORS: Errors = {
 local Socket = {}
 Socket.__index = Socket
 Socket.rooms = {}
+Socket.cache = {}
+Socket._creating = {}
+Socket._persistentRooms = {}
 Socket.version = "0.1.0"
 
 export type ParallelOperation = {
@@ -57,7 +65,7 @@ export type ParallelResult = {
 	errors: {[string]: string?}
 }
 
-export type MiddlewareFunction = (direction: string, eventName: string, args: {any}) -> (string, {any})
+export type MiddlewareFunction = (direction: string, eventName: string, args: {any}, player: Player?) -> (string, {any})
 export type ListenerCallback = (...any) -> ...any
 
 export type SocketOptions = {
@@ -78,6 +86,7 @@ export type Socket = {
 	-- Core communication methods
 	On: (self: Socket, eventName: string, callback: ListenerCallback) -> (),
 	Off: (self: Socket, eventName: string, callback: ListenerCallback?) -> (),
+	Detach: (self: Socket, eventName: string) -> (),
 	Once: (self: Socket, eventName: string, callback: ListenerCallback) -> (),
 	Emit: (self: Socket, eventName: string, ...any) -> (),
 	EmitUnreliable: (self: Socket, eventName: string, ...any) -> (),
@@ -88,9 +97,11 @@ export type Socket = {
 	-- Middleware methods
 	UseIncoming: (self: Socket, middleware: MiddlewareFunction) -> (),
 	UseOutgoing: (self: Socket, middleware: MiddlewareFunction) -> (),
-	_applyMiddleware: (self: Socket, middlewareList: {MiddlewareFunction}, direction: string, eventName: string, args: {any}) -> (string, {any}),
+	_applyMiddleware: (self: Socket, middlewareList: {MiddlewareFunction}, direction: string, eventName: string, args: {any}, player: Player?) -> (string, {any}),
 	
 	-- Room functionality
+	CreateRoom: (self: Socket, roomName: string) -> (),
+	DestroyRoom: (self: Socket, roomName: string) -> (),
 	JoinRoom: (self: Socket, player: Player, roomName: string) -> (),
 	LeaveRoom: (self: Socket, player: Player, roomName: string) -> (),
 	BroadcastToRoom: (self: Socket, roomName: string, eventName: string, ...any) -> (),
@@ -107,12 +118,34 @@ export type Socket = {
 	
 	-- Utility methods
 	Ping: (self: Socket) -> number,
+	Destroy: (self: Socket) -> (),
 	initialize: (self: Socket) -> (),
 }
 
 function Socket.new(idOrRemoteEvent: any, options: boolean | SocketOptions?): Socket
+	-- Sockets are cached by name; requesting an existing socket returns it
+	-- (options are only applied by whichever call constructs the socket).
+	local cacheKey: string
+	if typeof(idOrRemoteEvent) == "Instance" then
+		cacheKey = idOrRemoteEvent.Name
+	elseif typeof(idOrRemoteEvent) == "string" then
+		cacheKey = idOrRemoteEvent
+	else
+		cacheKey = "SocketEvent"
+	end
+
+	-- If the same socket is mid-construction in another thread (client
+	-- construction can yield waiting for the RemoteEvent), wait for it.
+	while Socket._creating[cacheKey] do
+		task.wait()
+	end
+	if Socket.cache[cacheKey] then
+		return Socket.cache[cacheKey]
+	end
+	Socket._creating[cacheKey] = true
+
 	local self = setmetatable({}, Socket) :: Socket
-	
+
 	-- Handle backwards compatibility with the old debug parameter
 	local opts: SocketOptions = {}
 	if typeof(options) == "boolean" then
@@ -149,7 +182,8 @@ function Socket.new(idOrRemoteEvent: any, options: boolean | SocketOptions?): So
 					self.remoteEvent = reliableEvent
 				else
 					if RunService:IsClient() then
-						error("Cannot create a socket with an UnreliableRemoteEvent without its paired reliable RemoteEvent")
+						-- Yield until the server creates the paired reliable RemoteEvent
+						self.remoteEvent = ReplicatedStorage:WaitForChild(reliableName)
 					else
 						self.remoteEvent = Instance.new("RemoteEvent")
 						self.remoteEvent.Name = reliableName
@@ -166,7 +200,8 @@ function Socket.new(idOrRemoteEvent: any, options: boolean | SocketOptions?): So
 				self.remoteEvent = existing
 			else
 				if RunService:IsClient() then
-					error(string.format(ERRORS.REM_EVT_NOT_FOUND, eventName))
+					-- Yield until the server creates the RemoteEvent
+					self.remoteEvent = ReplicatedStorage:WaitForChild(eventName)
 				else
 					self.remoteEvent = Instance.new("RemoteEvent")
 					self.remoteEvent.Name = eventName
@@ -215,7 +250,8 @@ function Socket.new(idOrRemoteEvent: any, options: boolean | SocketOptions?): So
 				self.remoteEvent = existing
 			else
 				if RunService:IsClient() then
-					error(string.format(ERRORS.DEFAULT_REM_EVT_NOT_FOUND, eventName))
+					-- Yield until the server creates the RemoteEvent
+					self.remoteEvent = ReplicatedStorage:WaitForChild(eventName)
 				else
 					self.remoteEvent = Instance.new("RemoteEvent")
 					self.remoteEvent.Name = eventName
@@ -265,7 +301,8 @@ function Socket.new(idOrRemoteEvent: any, options: boolean | SocketOptions?): So
 			self.remoteEvent = existing
 		else
 			if RunService:IsClient() then
-				error(string.format(ERRORS.DEFAULT_REM_EVT_NOT_FOUND, eventName))
+				-- Yield until the server creates the RemoteEvent
+				self.remoteEvent = ReplicatedStorage:WaitForChild(eventName)
 			else
 				self.remoteEvent = Instance.new("RemoteEvent")
 				self.remoteEvent.Name = eventName
@@ -308,6 +345,10 @@ function Socket.new(idOrRemoteEvent: any, options: boolean | SocketOptions?): So
 	end
 
 	self:initialize()
+
+	self._cacheKey = cacheKey
+	Socket.cache[cacheKey] = self
+	Socket._creating[cacheKey] = nil
 	return self
 end
 
@@ -320,9 +361,9 @@ function Socket:UseOutgoing(middleware: MiddlewareFunction)
 end
 
 -- Add helper function to process middleware
-function Socket:_applyMiddleware(middlewareList: {MiddlewareFunction}, direction: string, eventName: string, args: {any}): (string, {any})
+function Socket:_applyMiddleware(middlewareList: {MiddlewareFunction}, direction: string, eventName: string, args: {any}, player: Player?): (string, {any})
 	for _, mw in ipairs(middlewareList) do
-		eventName, args = mw(direction, eventName, args)
+		eventName, args = mw(direction, eventName, args, player)
 	end
 	return eventName, args
 end
@@ -405,7 +446,7 @@ function Socket:initialize()
 			-- Set up reliable RemoteEvent handler
 			local reliableConnection = self.remoteEvent.OnServerEvent:Connect(function(player: Player, command: string, ...: any)
 				local args = { ... }
-				command, args = self:_applyMiddleware(self.incomingMiddleware, "incoming", command, args)
+				command, args = self:_applyMiddleware(self.incomingMiddleware, "incoming", command, args, player)
 				if command == "CallRequest" then
 					local targetEvent, requestId = table.unpack(args)
 					local callbacks = self.listeners[targetEvent]
@@ -449,7 +490,7 @@ function Socket:initialize()
 			if self.unreliable and self.unreliableRemoteEvent then
 				local unreliableConnection = self.unreliableRemoteEvent.OnServerEvent:Connect(function(player: Player, command: string, ...: any)
 					local args = { ... }
-					command, args = self:_applyMiddleware(self.incomingMiddleware, "incoming", command, args)
+					command, args = self:_applyMiddleware(self.incomingMiddleware, "incoming", command, args, player)
 					local callbacks = self.listeners[command]
 					if callbacks then
 						for _, callback in ipairs(callbacks) do
@@ -500,6 +541,14 @@ function Socket:Off(eventName: string, callback: ListenerCallback?)
 		if self.debug then
 			print("[Socket DEBUG] Removed all listeners for event:", eventName)
 		end
+	end
+end
+
+-- Unhooks every listener registered for the given event name
+function Socket:Detach(eventName: string)
+	self.listeners[eventName] = nil
+	if self.debug then
+		print("[Socket DEBUG] Detached all listeners for event:", eventName)
 	end
 end
 
@@ -721,8 +770,34 @@ function Socket:LeaveRoom(player: Player, roomName: string)
 			break
 		end
 	end
-	if #self.rooms[roomName] == 0 then
-		self.rooms[roomName] = nil -- Remove empty room
+	if #self.rooms[roomName] == 0 and not self._persistentRooms[roomName] then
+		self.rooms[roomName] = nil -- Remove empty room (rooms made via CreateRoom persist)
+	end
+end
+
+function Socket:CreateRoom(roomName: string)
+	if RunService:IsClient() then
+		error(ERRORS.NOT_SERVER)
+	end
+
+	self._persistentRooms[roomName] = true
+	if not self.rooms[roomName] then
+		self.rooms[roomName] = {}
+	end
+	if self.debug then
+		print("[Socket DEBUG] Created room:", roomName)
+	end
+end
+
+function Socket:DestroyRoom(roomName: string)
+	if RunService:IsClient() then
+		error(ERRORS.NOT_SERVER)
+	end
+
+	self._persistentRooms[roomName] = nil
+	self.rooms[roomName] = nil
+	if self.debug then
+		print("[Socket DEBUG] Destroyed room:", roomName)
 	end
 end
 
@@ -788,6 +863,41 @@ function Socket:Ping(): number
 		print("[Socket DEBUG] Ping latency:", latency)
 	end
 	return latency
+end
+
+-- Tears the socket down: disconnects handlers, drops listeners and pending
+function Socket:Destroy()
+	for _, connection in ipairs(self._connections or {}) do
+		if typeof(connection) == "RBXScriptConnection" and connection.Connected then
+			connection:Disconnect()
+		end
+	end
+	self._connections = {}
+	self.listeners = {}
+
+	if self.pendingRequests then
+		for _, bindable in pairs(self.pendingRequests) do
+			bindable:Destroy()
+		end
+		table.clear(self.pendingRequests)
+	end
+
+	if self._cacheKey and Socket.cache[self._cacheKey] == self then
+		Socket.cache[self._cacheKey] = nil
+	end
+
+	if RunService:IsServer() then
+		if self.remoteEvent then
+			self.remoteEvent:Destroy()
+		end
+		if self.unreliableRemoteEvent then
+			self.unreliableRemoteEvent:Destroy()
+		end
+	end
+
+	if self.debug then
+		print("[Socket DEBUG] Destroyed socket:", tostring(self._cacheKey))
+	end
 end
 
 function Socket:ScheduleBroadcast(delay: number, eventName: string, ...: any)
@@ -1065,6 +1175,23 @@ function Socket:CallParallel(operations: {ParallelOperation}, strategy: string?)
 		results = results,
 		errors = errors
 	}
+end
+
+-- Rooms hold player references; drop them automatically when a player leaves
+-- so no socket keeps a leaving player alive or broadcasts to them.
+if RunService:IsServer() then
+	game:GetService("Players").PlayerRemoving:Connect(function(player: Player)
+		for roomName, room in pairs(Socket.rooms) do
+			for i = #room, 1, -1 do
+				if room[i] == player then
+					table.remove(room, i)
+				end
+			end
+			if #room == 0 and not Socket._persistentRooms[roomName] then
+				Socket.rooms[roomName] = nil
+			end
+		end
+	end)
 end
 
 return Socket
